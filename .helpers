@@ -1,0 +1,276 @@
+# Function to enable Touch ID authentication for sudo commands on macOS
+enable_sudo_touch_id() {
+    sed "s/^#auth/auth/" /etc/pam.d/sudo_local.template | sudo tee /etc/pam.d/sudo_local
+}
+
+# Function to add a host to the /etc/hosts file
+add_to_hosts() {
+    local hostname="${1}"
+    local ip="${2}"
+    
+    if [[ -z "$hostname" || -z "$ip" ]]; then
+        echo "Usage: add_to_hosts <hostname> <ip>"
+        return 1
+    fi
+    
+    # Check if entry already exists
+    if grep -F "${ip} ${hostname}" /etc/hosts >/dev/null 2>&1; then
+        echo "Entry '$hostname' -> '$ip' already exists in /etc/hosts"
+        return 1
+    fi
+    
+    # Add entry to hosts file (requires sudo)
+    sudo sh -c "printf '%s %s\n' '${ip}' '${hostname}' >> /etc/hosts"
+    echo "Added '$hostname' ($ip) to /etc/hosts"
+}
+
+# Function to add a host to the ~/.ssh/config file
+add_ssh_host() {
+    local host=$1
+    local user=$2
+    local ip=$3
+    local port=${4:-22}
+    
+    if [[ -z "$host" || -z "$user" || -z "$ip" ]]; then
+        echo "Usage: add_ssh_host <hostname> <username> <ip> [port]"
+        return 1
+    fi
+    
+    # Check if host already exists
+    if grep -q "^Host $host$" ~/.ssh/config 2>/dev/null; then
+        echo "Host '$host' already exists in ~/.ssh/config"
+        return 1
+    fi
+    
+    # Append to config
+    cat >> ~/.ssh/config << EOF
+
+Host $host
+    HostName $ip
+    User $user
+    Port $port
+EOF
+    
+    echo "Added host '$host' ($user@$ip:$port) to ~/.ssh/config"
+
+    # Ask if user wants to add to hosts file
+    read -q "add_hosts_prompt?$(tput setaf 1)Add '$host' ($ip) to /etc/hosts? (y/n)$(tput sgr0) "
+    echo
+    if [[ "$add_hosts_prompt" == "y" ]]; then
+        add_to_hosts "$host" "$ip"
+    fi
+    
+    # Ask if user wants to add their public key
+    read -q "add_key_prompt?$(tput setaf 1)Add your public SSH key to $user@$host? (y/n)$(tput sgr0) "
+    echo
+    if [[ "$add_key_prompt" == "y" ]]; then
+        add_ssh_key "$host" "$user"
+    fi
+}
+
+# Function to remove a host from known_hosts
+remove_host() {
+  if [ -z "$1" ]; then
+    echo "Usage: remove_host <hostname>"
+    return 1
+  fi
+  ssh-keygen -R "$1"
+}
+
+# Function to clone a GitLab repo in a folder structure matching the remote structure
+clone_gl_repo() {
+  local url="$1"
+  
+  if [[ -z "$url" ]]; then
+    echo "Usage: clone_gl_repo <repo_url>"
+    return 1
+  fi
+  
+  # Extract repo name and path
+  local repo_name
+  local repo_path
+  
+  if [[ "$url" =~ ^https://gitlab\.com/(.+)/([^/]+)(\.git)?$ ]]; then
+    repo_path="${match[1]}"
+    repo_name="${match[2]}"
+  elif [[ "$url" =~ ^git@gitlab\.com:(.+)/([^/]+)(\.git)?$ ]]; then
+    repo_path="${match[1]}"
+    repo_name="${match[2]}"
+  else
+    echo "Invalid URL format"
+    return 1
+  fi
+  
+  # Strip .git from repo_name if present
+  repo_name="${repo_name%.git}"
+  
+  # Create SSH URL (ensure it ends with .git)
+  local ssh_url="git@gitlab.com:${repo_path}/${repo_name}.git"
+  
+  # Create directory structure and navigate
+  local target_dir="$HOME/repos/gitlab.com/${repo_path}"
+  mkdir -p "$target_dir"
+  cd "$target_dir"
+  
+  # Clone the repository
+  git clone "$ssh_url"
+}
+
+# Function to add a public SSH key to a remote host's authorized_keys
+add_ssh_key() {
+    # Use KSH_ARRAYS for 0-based array indexing (compatible with bash)
+    setopt KSH_ARRAYS
+    
+    local remote_host="${1}"
+    local remote_user="${2:-$USER}"
+    
+    if [[ -z "$remote_host" ]]; then
+        echo "Usage: add_ssh_key <remote_host> [remote_user]"
+        return 1
+    fi
+    
+    # Find all .pub keys in ~/.ssh
+    local ssh_dir="$HOME/.ssh"
+    if [[ ! -d "$ssh_dir" ]]; then
+        echo "Error: ~/.ssh directory does not exist"
+        return 1
+    fi
+    
+    # Find .pub keys using a loop (more portable for macOS/zsh)
+    local pub_keys=()
+    local key
+    for key in "$ssh_dir"/*.pub; do
+        [[ -f "$key" ]] && pub_keys+=("$key")
+    done
+    
+    if [[ ${#pub_keys[@]} -eq 0 ]]; then
+        echo "Error: No public keys found in $ssh_dir"
+        return 1
+    fi
+    
+    local selected_key
+    
+    if [[ ${#pub_keys[@]} -eq 1 ]]; then
+        selected_key="${pub_keys[0]}"
+        echo "Found 1 public key: $(basename "$selected_key")"
+    else
+        echo "Found ${#pub_keys[@]} public keys. Please select one:"
+        echo
+        local i
+        for ((i = 0; i < ${#pub_keys[@]}; i++)); do
+            echo "$((i + 1)). $(basename "${pub_keys[$i]}")"
+        done
+        echo
+        
+        local choice
+        while true; do
+            print -n "$(tput setaf 1)Enter your choice (1-${#pub_keys[@]}):$(tput sgr0) "
+            read choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#pub_keys[@]} )); then
+                selected_key="${pub_keys[$((choice - 1))]}"
+                break
+            else
+                echo "Invalid choice. Please enter a number between 1 and ${#pub_keys[@]}."
+            fi
+        done
+    fi
+    
+    # Verify the selected key exists
+    if [[ ! -f "$selected_key" ]]; then
+        echo "Error: Selected key file not found: $selected_key"
+        return 1
+    fi
+    
+    # Use ssh-copy-id to add the key
+    echo "Adding public key $(basename "$selected_key") to $remote_user@$remote_host..."
+    
+    if ssh-copy-id -i "$selected_key" "$remote_user@$remote_host"; then
+        echo "✓ Public key successfully added to $remote_user@$remote_host"
+        return 0
+    else
+        echo "✗ Failed to add public key to $remote_user@$remote_host"
+        return 1
+    fi
+}
+
+update_helpers() {
+  git pull && cp .helpers ~/.helpers
+  source ~/.zshrc
+}
+
+# Ensure completion system is loaded
+autoload -Uz compinit
+compinit -C  # -C skips security check for faster loading
+
+# Custom function to provide host completions
+_custom_hosts() {
+    local -a custom_hosts
+    
+    # Extract hostnames from /etc/hosts (ignore comments, localhost, and IP addresses)
+    if [[ -f /etc/hosts ]]; then
+        custom_hosts+=(${(f)"$(awk '!/^#/ && !/^127\./ && !/^::1/ && !/^255\./ && !/^fe80/ && NF>=2 {for(i=2;i<=NF;i++) print $i}' /etc/hosts 2>/dev/null)"})
+    fi
+    
+    # Also include hosts from ~/.ssh/config if it exists
+    if [[ -f ~/.ssh/config ]]; then
+        custom_hosts+=(${(f)"$(awk '/^Host / && !/\*/ {for(i=2;i<=NF;i++) print $i}' ~/.ssh/config 2>/dev/null)"})
+    fi
+    
+    # Remove duplicates and provide completions
+    _describe 'hosts' custom_hosts
+}
+
+# Register the completion function for various commands
+compdef _custom_hosts ssh scp sftp ping rsync telnet ftp
+
+# Meta function to list all helper functions with descriptions and usage
+helpers() {
+    cat << 'EOF'
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                      AVAILABLE HELPER FUNCTIONS                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+0. enable_sudo_touch_id
+   Description: Enable Touch ID authentication for sudo commands on macOS
+   Usage: enable_sudo_touch_id
+   Note: Requires macOS with Touch ID support. Modifies /etc/pam.d/sudo_local
+
+1. add_to_hosts <hostname> <ip>
+   Description: Add a hostname mapping to /etc/hosts file
+   Usage: add_to_hosts "example.com" "192.168.1.100"
+   Note: Requires sudo access
+
+2. add_ssh_host <hostname> <username> <ip> [port]
+   Description: Add an SSH host configuration to ~/.ssh/config
+   Usage: add_ssh_host "myserver" "ubuntu" "192.168.1.100" 2222
+   Note: Optional port defaults to 22. Will prompt to add host to /etc/hosts
+         and optionally add your public SSH key to the remote host.
+
+3. remove_host <hostname>
+   Description: Remove a hostname from ~/.ssh/known_hosts
+   Usage: remove_host "example.com"
+   Note: Useful after server reinstall or key change
+
+4. clone_gl_repo <repo_url>
+   Description: Clone a GitLab repository maintaining folder structure
+   Usage: clone_gl_repo "https://gitlab.com/group/subgroup/repo.git"
+          clone_gl_repo "git@gitlab.com:group/subgroup/repo.git"
+   Note: Creates ~/repos/gitlab.com/group/subgroup/ structure
+
+5. add_ssh_key <remote_host> [remote_user]
+   Description: Add a local SSH public key to a remote host's authorized_keys
+   Usage: add_ssh_key "example.com" "ubuntu"
+          add_ssh_key "example.com"
+   Note: If multiple keys exist, you'll be prompted to choose one.
+         Remote user defaults to current user if not specified.
+
+6. Auto-completion for network commands
+   Description: Automatically enables tab completion for ssh, scp, ping, etc.
+   Source: Reads hostnames from /etc/hosts and ~/.ssh/config
+   Commands: ssh, scp, sftp, ping, telnet, ftp, rsync
+   Note: Automatically initialized when .helpers is sourced.
+         Type 'ssh <TAB>' to see available hosts.
+
+╚══════════════════════════════════════════════════════════════════════════════╝
+EOF
+}
