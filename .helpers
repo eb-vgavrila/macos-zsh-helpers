@@ -9,19 +9,40 @@ add_to_hosts() {
     local ip="${2}"
     
     if [[ -z "$hostname" || -z "$ip" ]]; then
-        echo "Usage: add_to_hosts <hostname> <ip>"
+        echo "Usage: add_to_hosts <hostname[,alias1,alias2,...]> <ip>"
         return 1
     fi
     
-    # Check if entry already exists
-    if grep -F "${ip} ${hostname}" /etc/hosts >/dev/null 2>&1; then
-        echo "Entry '$hostname' -> '$ip' already exists in /etc/hosts"
+    # Split comma-separated hostnames into array
+    local -a hostnames
+    IFS=',' read -rA hostnames <<< "$hostname"
+    
+    # Trim whitespace from each hostname
+    local -a trimmed_hostnames
+    for h in "${hostnames[@]}"; do
+        trimmed_hostnames+=("${h## }")
+        trimmed_hostnames[-1]="${trimmed_hostnames[-1]%% }"
+    done
+    
+    # Check if any entry already exists
+    local existing_hosts=()
+    for h in "${trimmed_hostnames[@]}"; do
+        if grep -F "${ip} ${h}" /etc/hosts >/dev/null 2>&1; then
+            existing_hosts+=("$h")
+        fi
+    done
+    
+    if [[ ${#existing_hosts[@]} -gt 0 ]]; then
+        echo "The following hostname(s) already exist for IP '$ip' in /etc/hosts: ${existing_hosts[*]}"
         return 1
     fi
+    
+    # Build the hosts entry with all hostnames
+    local hosts_entry="${ip} ${(j: :)trimmed_hostnames}"
     
     # Add entry to hosts file (requires sudo)
-    sudo sh -c "printf '%s %s\n' '${ip}' '${hostname}' >> /etc/hosts"
-    echo "Added '$hostname' ($ip) to /etc/hosts"
+    sudo sh -c "printf '%s\n' '${hosts_entry}' >> /etc/hosts"
+    echo "Added '${(j:, :)trimmed_hostnames}' ($ip) to /etc/hosts"
 }
 
 # Function to add a host to the ~/.ssh/config file
@@ -32,39 +53,65 @@ add_ssh_host() {
     local port=${4:-22}
     
     if [[ -z "$host" || -z "$user" || -z "$ip" ]]; then
-        echo "Usage: add_ssh_host <hostname> <username> <ip> [port]"
+        echo "Usage: add_ssh_host <hostname[,alias1,alias2,...]> <username> <ip> [port]"
         return 1
     fi
     
-    # Check if host already exists
-    if grep -q "^Host $host$" ~/.ssh/config 2>/dev/null; then
-        echo "Host '$host' already exists in ~/.ssh/config"
+    # Split comma-separated hostnames into array
+    local -a hostnames
+    IFS=',' read -rA hostnames <<< "$host"
+    
+    # Trim whitespace from each hostname
+    local -a trimmed_hostnames
+    for h in "${hostnames[@]}"; do
+        trimmed_hostnames+=("${h## }")
+        trimmed_hostnames[-1]="${trimmed_hostnames[-1]%% }"
+    done
+    
+    # Get the primary hostname (first one)
+    local primary_host="${trimmed_hostnames[1]}"
+    
+    # Check if any host already exists
+    local existing_hosts=()
+    for h in "${trimmed_hostnames[@]}"; do
+        if grep -q "^Host $h$" ~/.ssh/config 2>/dev/null; then
+            existing_hosts+=("$h")
+        fi
+    done
+    
+    if [[ ${#existing_hosts[@]} -gt 0 ]]; then
+        echo "The following host(s) already exist in ~/.ssh/config: ${existing_hosts[*]}"
         return 1
     fi
     
-    # Append to config
-    cat >> ~/.ssh/config << EOF
-
-Host $host
+    # Append to config - create entry for each hostname/alias
+    {
+        echo ""
+        for h in "${trimmed_hostnames[@]}"; do
+            cat << EOF
+Host $h
     HostName $ip
     User $user
     Port $port
-EOF
-    
-    echo "Added host '$host' ($user@$ip:$port) to ~/.ssh/config"
 
-    # Ask if user wants to add to hosts file
-    read -q "add_hosts_prompt?$(tput setaf 1)Add '$host' ($ip) to /etc/hosts? (y/n)$(tput sgr0) "
+EOF
+        done
+    } >> ~/.ssh/config
+    
+    echo "Added host(s) '${(j:, :)trimmed_hostnames}' ($user@$ip:$port) to ~/.ssh/config"
+
+    # Ask if user wants to add to hosts file (with all hostnames/aliases)
+    read -q "add_hosts_prompt?$(tput setaf 1)Add '${(j:, :)trimmed_hostnames}' ($ip) to /etc/hosts? (y/n)$(tput sgr0) "
     echo
     if [[ "$add_hosts_prompt" == "y" ]]; then
         add_to_hosts "$host" "$ip"
     fi
     
     # Ask if user wants to add their public key
-    read -q "add_key_prompt?$(tput setaf 1)Add your public SSH key to $user@$host? (y/n)$(tput sgr0) "
+    read -q "add_key_prompt?$(tput setaf 1)Add your public SSH key to $user@$primary_host? (y/n)$(tput sgr0) "
     echo
     if [[ "$add_key_prompt" == "y" ]]; then
-        add_ssh_key "$host" "$user"
+        add_ssh_key "$primary_host" "$user"
     fi
 }
 
@@ -230,41 +277,50 @@ helpers() {
 ║                      AVAILABLE HELPER FUNCTIONS                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
-0. enable_sudo_touch_id
+0. update_helpers
+   Description: Update the helpers file from the git repository
+   Usage: update_helpers
+   Note: Must be called from the macos-zsh-helpers repository folder.
+         Pulls latest changes and updates ~/.helpers, then reloads .zshrc
+
+1. enable_sudo_touch_id
    Description: Enable Touch ID authentication for sudo commands on macOS
    Usage: enable_sudo_touch_id
    Note: Requires macOS with Touch ID support. Modifies /etc/pam.d/sudo_local
 
-1. add_to_hosts <hostname> <ip>
-   Description: Add a hostname mapping to /etc/hosts file
+2. add_to_hosts <hostname[,alias1,alias2,...]> <ip>
+   Description: Add hostname mapping(s) to /etc/hosts file
    Usage: add_to_hosts "example.com" "192.168.1.100"
-   Note: Requires sudo access
+          add_to_hosts "host1,host2,host3" "192.168.1.100"
+   Note: Requires sudo access. Supports comma-separated hostnames for same IP.
 
-2. add_ssh_host <hostname> <username> <ip> [port]
+3. add_ssh_host <hostname[,alias1,alias2,...]> <username> <ip> [port]
    Description: Add an SSH host configuration to ~/.ssh/config
    Usage: add_ssh_host "myserver" "ubuntu" "192.168.1.100" 2222
-   Note: Optional port defaults to 22. Will prompt to add host to /etc/hosts
+          add_ssh_host "myserver,alias1,alias2" "ubuntu" "192.168.1.100"
+   Note: Optional port defaults to 22. Will prompt to add host(s) to /etc/hosts
          and optionally add your public SSH key to the remote host.
+         Comma-separated names will add all as aliases in /etc/hosts.
 
-3. remove_host <hostname>
+4. remove_host <hostname>
    Description: Remove a hostname from ~/.ssh/known_hosts
    Usage: remove_host "example.com"
    Note: Useful after server reinstall or key change
 
-4. clone_gl_repo <repo_url>
+5. clone_gl_repo <repo_url>
    Description: Clone a GitLab repository maintaining folder structure
    Usage: clone_gl_repo "https://gitlab.com/group/subgroup/repo.git"
           clone_gl_repo "git@gitlab.com:group/subgroup/repo.git"
    Note: Creates ~/repos/gitlab.com/group/subgroup/ structure
 
-5. add_ssh_key <remote_host> [remote_user]
+6. add_ssh_key <remote_host> [remote_user]
    Description: Add a local SSH public key to a remote host's authorized_keys
    Usage: add_ssh_key "example.com" "ubuntu"
           add_ssh_key "example.com"
    Note: If multiple keys exist, you'll be prompted to choose one.
          Remote user defaults to current user if not specified.
 
-6. Auto-completion for network commands
+7. Auto-completion for network commands
    Description: Automatically enables tab completion for ssh, scp, ping, etc.
    Source: Reads hostnames from /etc/hosts and ~/.ssh/config
    Commands: ssh, scp, sftp, ping, telnet, ftp, rsync
